@@ -292,6 +292,15 @@ export interface GameMode {
   math: MathModule;
   /** Bet stake-multiplier (base = 1, feature buys typically 10-100). */
   stakeMultiplier: number;
+  /** Price a round from its own params instead of the fixed
+   *  `stakeMultiplier`: the stake multiplier for this round, from what the
+   *  player chose (a bet per reel, say), so a game whose stake depends on
+   *  the choices needs one mode, not one per combination. The server calls
+   *  it; the client never sends an amount (guarantee 4). It must be pure
+   *  and return a finite number >= 0; throwing, or any other value, refuses
+   *  the round with INVALID_BET before money moves. When set,
+   *  `stakeMultiplier` is only what the catalog shows. */
+  priceOf?: (params: Readonly<Record<string, unknown>> | undefined) => number;
   /** Human-readable label surfaced to the client. */
   label?: string;
   /** True = mode cannot be requested by the client directly; only routed
@@ -791,7 +800,7 @@ export interface ClientResponseInit {
   currencyDecimals: number;
   allowedBets: number[];
   defaultBetIndex: number;
-  modes: { id: string; label?: string; stakeMultiplier: number; declaredRtp?: number }[];
+  modes: { id: string; label?: string; stakeMultiplier: number; declaredRtp?: number; pricedByParams?: true }[];
   /** Active promo free-rounds pool surfaced to the client for the
    *  opt-in offer. Mirrors `SessionInfo.promo`. Absent when none. */
   promo?: { id: string; bet: number; remaining: number; total?: number; label?: string; validTo?: string };

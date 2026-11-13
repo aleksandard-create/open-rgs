@@ -377,13 +377,14 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     modeId: string,
     requestedBetIndex: number | undefined,
     requestedPriceMultiplier: number | undefined,
-  ): { bet: number; betIndex: number; priceMultiplier: number; effectiveCost: number; promoId?: string } {
+    params?: Readonly<Record<string, unknown>>,
+  ): { bet: number; betIndex: number; priceMultiplier: number; stake: number; effectiveCost: number; promoId?: string } {
     const promoOv = promo.activeOverride(s, modeId);
     if (promoOv) {
       const idx = s.allowedBets.indexOf(promoOv.bet);
       if (idx < 0) throw new RGSError("INVALID_BET", "Promo-locked bet not in allowedBets");
       // Promo-overridden free rounds skip stake fold by definition.
-      return { bet: promoOv.bet, betIndex: idx, priceMultiplier: 1, effectiveCost: promoOv.bet, promoId: promoOv.promoId };
+      return { bet: promoOv.bet, betIndex: idx, priceMultiplier: 1, stake: 1, effectiveCost: promoOv.bet, promoId: promoOv.promoId };
     }
     const betIndex = requestedBetIndex ?? s.defaultBetIndex;
     if (!Number.isInteger(betIndex) || betIndex < 0 || betIndex >= s.allowedBets.length) {
@@ -416,15 +417,37 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     // currency precision. Used for balance check, max-win cap input,
     // win calc, and the audit log's "amount paid" field, never sent
     // on the wire as `bet`.
-    const effectiveCost = bet * mode.stakeMultiplier;
-    return { bet, betIndex, priceMultiplier, effectiveCost };
+    const stake = stakeOf(mode, modeId, params);
+    const effectiveCost = bet * stake;
+    return { bet, betIndex, priceMultiplier, stake, effectiveCost };
+  }
+
+  /** The round's stake multiplier: the mode's `priceOf(params)` when it
+   *  prices by params, else its fixed `stakeMultiplier`. A price that
+   *  throws or is not a finite number >= 0 refuses the round (fail closed,
+   *  guarantee 5) before anything moves. */
+  function stakeOf(mode: GameMode, modeId: string, params: Readonly<Record<string, unknown>> | undefined): number {
+    if (!mode.priceOf) return mode.stakeMultiplier;
+    let stake: unknown;
+    try {
+      stake = mode.priceOf(params);
+    } catch (e) {
+      throw new RGSError("INVALID_BET", `Mode '${modeId}' refused these params: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (typeof stake !== "number" || !Number.isFinite(stake) || stake < 0) {
+      throw new RGSError("INVALID_BET", `Mode '${modeId}' priced these params at ${String(stake)}; a price is a finite number >= 0`);
+    }
+    return stake;
   }
 
   function modeCatalogForClient() {
-    const out: { id: string; label?: string; stakeMultiplier: number; declaredRtp?: number }[] = [];
+    const out: { id: string; label?: string; stakeMultiplier: number; declaredRtp?: number; pricedByParams?: true }[] = [];
     for (const [id, m] of Object.entries(manifest.modes)) {
       if (m.internal) continue;
-      out.push({ id, label: m.label, stakeMultiplier: m.stakeMultiplier, declaredRtp: m.declaredRtp ?? m.math.rtp });
+      out.push({
+        id, label: m.label, stakeMultiplier: m.stakeMultiplier, declaredRtp: m.declaredRtp ?? m.math.rtp,
+        ...(m.priceOf ? { pricedByParams: true as const } : {}),
+      });
     }
     return out;
   }
@@ -654,7 +677,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       throw new RGSError("INVALID_MODE", `Mode '${requestedMode}' is complex; use openRound instead`);
     }
 
-    const betInfo = computeBet(s, mode, requestedMode, req.betIndex, req.priceMultiplier);
+    const betInfo = computeBet(s, mode, requestedMode, req.betIndex, req.priceMultiplier, req.params);
 
     if (!betInfo.promoId && betInfo.effectiveCost > s.balance) {
       // Refused before anything moved - the audit vocabulary's `rejected`.
@@ -670,7 +693,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     // first-class wire field. Ignored entirely when cheatsEnabled is false.
     const ctx = buildSpinContext(
       requestedMode,
-      { betIndex: betInfo.betIndex, priceMultiplier: betInfo.priceMultiplier * mode.stakeMultiplier },
+      { betIndex: betInfo.betIndex, priceMultiplier: betInfo.priceMultiplier * betInfo.stake },
       req.params?.["cheat"] as Record<string, unknown> | undefined,
       req.params,
     );
@@ -714,7 +737,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         sessionId: s.sessionId,
         bet: betInfo.bet,
         betIndex: betInfo.betIndex,
-        priceMultiplier: betInfo.priceMultiplier * mode.stakeMultiplier,
+        priceMultiplier: betInfo.priceMultiplier * betInfo.stake,
         win,
         multiplier: cappedOutcome.multiplier,
         type: cappedOutcome.type,
@@ -792,7 +815,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
       throw new RGSError("INVALID_MODE", `Mode '${requestedMode}' is simple; use spin instead`);
     }
 
-    const betInfo = computeBet(s, mode, requestedMode, req.betIndex, req.priceMultiplier);
+    const betInfo = computeBet(s, mode, requestedMode, req.betIndex, req.priceMultiplier, req.params);
     if (!betInfo.promoId && betInfo.effectiveCost > s.balance) {
       recordAudit(mode, {
         sessionId: s.sessionId, roundId: "", kind: "open",
@@ -808,7 +831,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
     // most needed, because everything after it is a branch.
     const ctx = buildSpinContext(
       requestedMode,
-      { betIndex: betInfo.betIndex, priceMultiplier: betInfo.priceMultiplier * mode.stakeMultiplier },
+      { betIndex: betInfo.betIndex, priceMultiplier: betInfo.priceMultiplier * betInfo.stake },
       req.params?.["cheat"] as Record<string, unknown> | undefined,
       req.params,
     );
@@ -823,7 +846,7 @@ export function createOrchestrator(cfg: OrchestratorConfig): OrchestratorAPI {
         sessionId: s.sessionId,
         bet: betInfo.bet,
         betIndex: betInfo.betIndex,
-        priceMultiplier: betInfo.priceMultiplier * mode.stakeMultiplier,
+        priceMultiplier: betInfo.priceMultiplier * betInfo.stake,
         initialState: open.state,
         ...(mode.math.version ? { mathVersion: mode.math.version } : {}),
         idempotencyKey: initiatingIdemKey(s.sessionId, "open", req.idempotencyKey),
